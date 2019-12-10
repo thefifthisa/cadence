@@ -1,6 +1,5 @@
-// This example is heavily based on the tutorial at https://open.gl
-
 ////////////////////////////////////////////////////////////////////////////////
+
 // OpenGL Helpers to reduce the clutter
 #include "helpers.h"
 // GLFW is necessary to handle the OpenGL context
@@ -9,13 +8,61 @@
 #include <Eigen/Dense>
 // Timer
 #include <chrono>
+
+#include <iostream>
+#include <random>
+#include <cmath>
+#define _USE_MATH_DEFINES
+
+#define DR_FLAC_IMPLEMENTATION
+#include "extras/dr_flac.h"  /* Enables FLAC decoding. */
+#define DR_MP3_IMPLEMENTATION
+#include "extras/dr_mp3.h"   /* Enables MP3 decoding. */
+#define DR_WAV_IMPLEMENTATION
+#include "extras/dr_wav.h"   /* Enables WAV decoding. */
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
+
+#include <unsupported/Eigen/FFT>
+
 ////////////////////////////////////////////////////////////////////////////////
 
 // VertexBufferObject wrapper
 VertexBufferObject VBO;
+VertexBufferObject VBO_C;
 
-// Contains the vertex positions
-Eigen::MatrixXf V(2,3);
+// number of vertices
+int total_vertices = 0;
+
+// vertex positions
+Eigen::MatrixXf V;
+
+// per-vertex colors
+Eigen::MatrixXf C;
+Eigen::MatrixXf colors(3,9); 
+
+// view transformation
+Eigen::Matrix4f view(4,4);
+
+// audio stuff
+std::string filename = "";
+ma_result result;
+ma_decoder decoder;
+ma_device_config deviceConfig;
+ma_device device;
+
+// fft stuff
+Eigen::FFT<float> fft;
+
+// random
+std::random_device rd;
+std::mt19937 gen(rd());
+std::uniform_int_distribution<> dis(0, 8);
+
+// constants
+int CHANNEL_COUNT, WIDTH, HEIGHT;
+
+////////////////////////////////////////////////////////////////////////////////
 
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
 	// Get viewport size (canvas in number of pixels)
@@ -36,39 +83,141 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 	ypos *= highdpi;
 
 	// Convert screen position to world coordinates
-	double xworld = ((xpos/double(width))*2)-1;
-	double yworld = (((height-1-ypos)/double(height))*2)-1; // NOTE: y axis is flipped in glfw
+	Eigen::Vector4f p_screen(xpos,height-1-ypos,0,1);
+    Eigen::Vector4f p_canonical((p_screen[0]/width)*2-1,(p_screen[1]/height)*2-1,0,1); // NOTE: y axis is flipped in glfw
+    Eigen::Vector4f p_world = view.inverse() * p_canonical;
 
-	// Update the position of the first vertex if the left button is pressed
 	if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
-		V.col(0) << xworld, yworld;
+		/*
+		// sanity check
+		V.conservativeResize(Eigen::NoChange, total_vertices+1);
+		C.conservativeResize(Eigen::NoChange, total_vertices+1);
+
+		V.col(total_vertices) << p_world.x(), p_world.y();
+		C.col(total_vertices) << colors.col(dis(gen));
+
+		total_vertices++;
+		*/
 	}
 
 	// Upload the change to the GPU
 	VBO.update(V);
+	VBO_C.update(C);
 }
 
 void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
-	// Update the position of the first vertex if the keys 1,2, or 3 are pressed
 	switch (key) {
-		case GLFW_KEY_1:
-			V.col(0) << -0.5, 0.5;
-			break;
-		case GLFW_KEY_2:
-			V.col(0) << 0, 0.5;
-			break;
-		case GLFW_KEY_3:
-			V.col(0) << 0.5, 0.5;
-			break;
 		default:
 			break;
 	}
 
 	// Upload the change to the GPU
 	VBO.update(V);
+	VBO_C.update(C);
 }
 
-int main(void) {
+void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount)
+{
+    ma_decoder* pDecoder = (ma_decoder*)pDevice->pUserData;
+    if (pDecoder == NULL) {
+        return;
+    }
+	
+	/*
+	// normal playback
+	ma_decoder_read_pcm_frames(pDecoder, pOutput, frameCount);
+	*/
+
+	// adapted from https://github.com/dr-soft/miniaudio/blob/master/examples/simple_mixing.c
+	int N = 4096;
+	float* pOutputF32 = (float*)pOutput;
+	float temp[N];
+    ma_uint32 tempCapInFrames = ma_countof(temp) / CHANNEL_COUNT;
+    ma_uint32 totalFramesRead = 0;
+
+    while (totalFramesRead < frameCount) {
+        ma_uint32 iSample;
+        ma_uint32 framesReadThisIteration;
+        ma_uint32 totalFramesRemaining = frameCount - totalFramesRead;
+        ma_uint32 framesToReadThisIteration = tempCapInFrames;
+        if (framesToReadThisIteration > totalFramesRemaining) {
+            framesToReadThisIteration = totalFramesRemaining;
+        }
+
+        framesReadThisIteration = (ma_uint32)ma_decoder_read_pcm_frames(pDecoder, temp, framesToReadThisIteration);
+        if (framesReadThisIteration == 0) {
+            break;
+        }
+
+		std::vector<float> timevec;
+		std::vector<std::complex<float>> freqvec;
+
+		// collect samples
+        for (iSample = 0; iSample < framesReadThisIteration*CHANNEL_COUNT; ++iSample) {
+			timevec.push_back(temp[iSample]);
+			pOutputF32[totalFramesRead*CHANNEL_COUNT + iSample] = temp[iSample]; // play audio
+        }
+
+		// perform fft
+		fft.fwd(freqvec, timevec);
+
+		total_vertices = freqvec.size()/2;
+		V.conservativeResize(2, total_vertices);
+		C.conservativeResize(3, total_vertices);
+
+		float space = 2.0/total_vertices;
+		float pos = -total_vertices*space/2.0;
+		
+		std::vector<float> freqvec_abs;
+		for (int i = 0; i < freqvec.size()/2; i++) {
+			freqvec_abs.push_back(std::abs(freqvec[i])); // get magnitudes of complex numbers
+		}
+
+		float max = *max_element(freqvec_abs.begin(), freqvec_abs.end()); 
+		float min = *min_element(freqvec_abs.begin(), freqvec_abs.end()); 
+
+		for (int i = 0; i < freqvec_abs.size(); i++) {
+			float data = -1 + ((1-(-1))/(max-min))*(freqvec_abs[i]-min); // map to canonical range
+			V.col(i) << pos, data;
+			C.col(i) << colors.col(dis(gen));
+			pos += space;
+		}
+
+        totalFramesRead += framesReadThisIteration;
+
+        if (framesReadThisIteration < framesToReadThisIteration) {
+            break;
+        }
+    }
+
+    (void)pInput;
+}
+
+int main(int argc, char *argv[]) {
+	// read in audio file
+	if (argc < 2) {
+        printf("Usage: ./cadence <filename>\n");
+        return -1;
+    }
+	filename = argv[1];
+
+	colors <<
+		0.345, 0.486, 0.486,
+		0, 0.247, 0.368,
+		0, 0.486, 0.518,
+		0.910, 0.839, 0.4,
+		0.620, 0.651, 0.082,
+		0.733, 0.878, 0.808,
+		0.996, 0.863, 0.757,
+		0.969, 0.631, 0.549,
+		0.945, 0.341, 0.247;
+
+	view <<
+		1,	0,	0,	0,
+		0,	1,	0,	0,
+		0,	0,	1,	0,
+		0,	0,	0,	1;
+
 	// Initialize the GLFW library
 	if (!glfwInit()) {
 		return -1;
@@ -88,7 +237,7 @@ int main(void) {
 #endif
 
 	// Create a windowed mode window and its OpenGL context
-	GLFWwindow * window = glfwCreateWindow(640, 480, "[Float] Hello World", NULL, NULL);
+	GLFWwindow * window = glfwCreateWindow(640, 480, "cadence: a real-time music visualizer", NULL, NULL);
 	if (!window) {
 		glfwTerminate();
 		return -1;
@@ -124,10 +273,12 @@ int main(void) {
 	// Initialize the VBO with the vertices data
 	// A VBO is a data container that lives in the GPU memory
 	VBO.init();
-
-	V.resize(2,3);
-	V << 0,  0.5, -0.5, 0.5, -0.5, -0.5;
+	V.resize(2, 1);
 	VBO.update(V);
+
+	VBO_C.init();
+	C.resize(3, 1);
+	VBO_C.update(C);
 
 	// Initialize the OpenGL Program
 	// A program controls the OpenGL pipeline and it must contains
@@ -137,20 +288,24 @@ int main(void) {
 		#version 150 core
 
 		in vec2 position;
+		uniform mat4 view;
+		in vec3 color;
+        out vec3 f_color;
 
 		void main() {
-			gl_Position = vec4(position, 0.0, 1.0);
+			gl_Position = view * vec4(position, 0.0, 1.0);
+			f_color = color;
 		}
 	)";
 
 	const GLchar* fragment_shader = R"(
 		#version 150 core
 
-		uniform vec3 triangleColor;
+		in vec3 f_color;
 		out vec4 outColor;
 
 		void main() {
-		    outColor = vec4(triangleColor, 1.0);
+		    outColor = vec4(f_color, 1.0);
 		}
 	)";
 
@@ -164,9 +319,7 @@ int main(void) {
 	// The following line connects the VBO we defined above with the position "slot"
 	// in the vertex shader
 	program.bindVertexAttribArray("position", VBO);
-
-	// Save the current time --- it will be used to dynamically change the triangle color
-	auto t_start = std::chrono::high_resolution_clock::now();
+	program.bindVertexAttribArray("color", VBO_C);
 
 	// Register the keyboard callback
 	glfwSetKeyCallback(window, key_callback);
@@ -174,12 +327,40 @@ int main(void) {
 	// Register the mouse callback
 	glfwSetMouseButtonCallback(window, mouse_button_callback);
 
+	// play sound (https://github.com/dr-soft/miniaudio/blob/master/examples/simple_playback.c)
+	result = ma_decoder_init_file(("../sounds/" + filename).c_str(), NULL, &decoder);
+	if (result != MA_SUCCESS) {
+		printf("Audio file does not exist or cannot be opened.\n");
+        return -1;
+    }
+
+	deviceConfig = ma_device_config_init(ma_device_type_playback);
+    deviceConfig.playback.format = decoder.outputFormat;
+    deviceConfig.playback.channels = decoder.outputChannels;
+	CHANNEL_COUNT = decoder.outputChannels;
+    deviceConfig.sampleRate = decoder.outputSampleRate;
+    deviceConfig.dataCallback = data_callback;
+    deviceConfig.pUserData = &decoder;
+
+	if (ma_device_init(NULL, &deviceConfig, &device) != MA_SUCCESS) {
+        printf("Failed to open playback device.\n");
+        ma_decoder_uninit(&decoder);
+        return -1;
+    }
+
+    if (ma_device_start(&device) != MA_SUCCESS) {
+        printf("Failed to start playback device.\n");
+        ma_device_uninit(&device);
+        ma_decoder_uninit(&decoder);
+        return -1;
+    }
+
 	// Loop until the user closes the window
 	while (!glfwWindowShouldClose(window)) {
 		// Set the size of the viewport (canvas) to the size of the application window (framebuffer)
-		int width, height;
-		glfwGetFramebufferSize(window, &width, &height);
-		glViewport(0, 0, width, height);
+		// int width, height;
+		glfwGetFramebufferSize(window, &WIDTH, &HEIGHT);
+		glViewport(0, 0, WIDTH, HEIGHT);
 
 		// Bind your VAO (not necessary if you have only one)
 		VAO.bind();
@@ -187,17 +368,16 @@ int main(void) {
 		// Bind your program
 		program.bind();
 
-		// Set the uniform value depending on the time difference
-		auto t_now = std::chrono::high_resolution_clock::now();
-		float time = std::chrono::duration_cast<std::chrono::duration<float>>(t_now - t_start).count();
-		glUniform3f(program.uniform("triangleColor"), (float)(sin(time * 4.0f) + 1.0f) / 2.0f, 0.0f, 0.0f);
+		glUniformMatrix4fv(program.uniform("view"), 1, GL_FALSE, view.data());
 
 		// Clear the framebuffer
-		glClearColor(0.5f, 0.5f, 0.5f, 1.0f);
+		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT);
 
-		// Draw a triangle
-		glDrawArrays(GL_TRIANGLES, 0, 3);
+		// visualize data
+		VBO.update(V);
+		VBO_C.update(C);
+		glDrawArrays(GL_LINE_STRIP, 0, total_vertices);
 
 		// Swap front and back buffers
 		glfwSwapBuffers(window);
@@ -206,10 +386,14 @@ int main(void) {
 		glfwPollEvents();
 	}
 
+	ma_device_uninit(&device);
+    ma_decoder_uninit(&decoder);
+
 	// Deallocate opengl memory
 	program.free();
 	VAO.free();
 	VBO.free();
+	VBO_C.free();
 
 	// Deallocate glfw internals
 	glfwTerminate();

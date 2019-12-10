@@ -11,6 +11,11 @@ add_executable(${PROJECT_NAME}
 	src/main.cpp
 	src/helpers.cpp
 	src/helpers.h
+	src/miniaudio.h
+	src/extras/dr_flac.h
+	src/extras/dr_mp3.h
+	src/extras/dr_wav.h
+	src/extras/stb_vorbis.c
 )
 
 # Use C++11 version of the standard
