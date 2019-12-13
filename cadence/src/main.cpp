@@ -6,11 +6,8 @@
 #include <GLFW/glfw3.h>
 // Linear Algebra Library
 #include <Eigen/Dense>
-// Timer
-#include <chrono>
 
 #include <iostream>
-#include <random>
 #include <cmath>
 #define _USE_MATH_DEFINES
 
@@ -27,19 +24,24 @@
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// constants
+#define	FREQUENCY_BINS	32
+#define	SMOOTHING_CONSTANT	0.00007
+#define GAMMA	2.0
+#define SCALE	0.05
+#define BAR_SPACE	0.03
+#define TOTAL_VERTICES	FREQUENCY_BINS*6+5 // each bar defined by 6 vertices
+int WIDTH, HEIGHT, CHANNEL_COUNT, SAMPLE_RATE;
+
 // VertexBufferObject wrapper
 VertexBufferObject VBO;
 VertexBufferObject VBO_C;
 
-// number of vertices
-int total_vertices = 0;
-
 // vertex positions
-Eigen::MatrixXf V;
+Eigen::MatrixXf V(2, TOTAL_VERTICES);
 
 // per-vertex colors
-Eigen::MatrixXf C;
-Eigen::MatrixXf colors(3,9); 
+Eigen::MatrixXf C(3, TOTAL_VERTICES);
 
 // view transformation
 Eigen::Matrix4f view(4,4);
@@ -53,68 +55,10 @@ ma_device device;
 
 // fft stuff
 Eigen::FFT<float> fft;
-
-// random
-std::random_device rd;
-std::mt19937 gen(rd());
-std::uniform_int_distribution<> dis(0, 8);
-
-// constants
-int CHANNEL_COUNT, WIDTH, HEIGHT;
+std::vector<float> freqvec_smooth(FREQUENCY_BINS, 0.0);
+float max = 0;
 
 ////////////////////////////////////////////////////////////////////////////////
-
-void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
-	// Get viewport size (canvas in number of pixels)
-	int width, height;
-	glfwGetFramebufferSize(window, &width, &height);
-
-	// Get the size of the window (may be different than the canvas size on retina displays)
-	int width_window, height_window;
-	glfwGetWindowSize(window, &width_window, &height_window);
-
-	// Get the position of the mouse in the window
-	double xpos, ypos;
-	glfwGetCursorPos(window, &xpos, &ypos);
-
-	// Deduce position of the mouse in the viewport
-	double highdpi = (double) width / (double) width_window;
-	xpos *= highdpi;
-	ypos *= highdpi;
-
-	// Convert screen position to world coordinates
-	Eigen::Vector4f p_screen(xpos,height-1-ypos,0,1);
-    Eigen::Vector4f p_canonical((p_screen[0]/width)*2-1,(p_screen[1]/height)*2-1,0,1); // NOTE: y axis is flipped in glfw
-    Eigen::Vector4f p_world = view.inverse() * p_canonical;
-
-	if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
-		/*
-		// sanity check
-		V.conservativeResize(Eigen::NoChange, total_vertices+1);
-		C.conservativeResize(Eigen::NoChange, total_vertices+1);
-
-		V.col(total_vertices) << p_world.x(), p_world.y();
-		C.col(total_vertices) << colors.col(dis(gen));
-
-		total_vertices++;
-		*/
-	}
-
-	// Upload the change to the GPU
-	VBO.update(V);
-	VBO_C.update(C);
-}
-
-void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
-	switch (key) {
-		default:
-			break;
-	}
-
-	// Upload the change to the GPU
-	VBO.update(V);
-	VBO_C.update(C);
-}
 
 void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount)
 {
@@ -128,7 +72,7 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
 	ma_decoder_read_pcm_frames(pDecoder, pOutput, frameCount);
 	*/
 
-	// adapted from https://github.com/dr-soft/miniaudio/blob/master/examples/simple_mixing.c
+	// accessing samples adapted from https://github.com/dr-soft/miniaudio/blob/master/examples/simple_mixing.c
 	int N = 4096;
 	float* pOutputF32 = (float*)pOutput;
 	float temp[N];
@@ -153,34 +97,76 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
 		std::vector<std::complex<float>> freqvec;
 
 		// collect samples
-        for (iSample = 0; iSample < framesReadThisIteration*CHANNEL_COUNT; ++iSample) {
-			timevec.push_back(temp[iSample]);
+		int total_samples = framesReadThisIteration*CHANNEL_COUNT;
+        for (iSample = 0; iSample < total_samples; ++iSample) {
+			float multiplier = 0.5 * (1 - cos(2*M_PI*iSample/total_samples));
+			timevec.push_back(multiplier * temp[iSample]); // apply hann window
 			pOutputF32[totalFramesRead*CHANNEL_COUNT + iSample] = temp[iSample]; // play audio
         }
 
 		// perform fft
 		fft.fwd(freqvec, timevec);
 
-		total_vertices = freqvec.size()/2;
-		V.conservativeResize(2, total_vertices);
-		C.conservativeResize(3, total_vertices);
+		// frequency range and time smoothing adapted from https://dlbeer.co.nz/articles/fftvis.html
+		float smoothing = pow(SMOOTHING_CONSTANT, ((float) freqvec.size()) / SAMPLE_RATE);
+		float frequencies = freqvec.size()/2;
+		int freq_start = 0;
+		for (int i = 0; i < FREQUENCY_BINS; i++) {
+			int freq_end = round(pow(((float) (i+1)) / FREQUENCY_BINS, GAMMA) * frequencies);
+			if (freq_end > frequencies) freq_end = frequencies;
+			float freq_width = freq_end - freq_start;
+			if (freq_width <= 0) freq_width = 1;
 
-		float space = 2.0/total_vertices;
-		float pos = -total_vertices*space/2.0;
-		
-		std::vector<float> freqvec_abs;
-		for (int i = 0; i < freqvec.size()/2; i++) {
-			freqvec_abs.push_back(std::abs(freqvec[i])); // get magnitudes of complex numbers
+			float bin_power = 0;
+			for (int j = 0; j < freq_width; j++) {
+				float power = pow(std::abs(freqvec[freq_start + j]), 2);
+				if (power > bin_power) bin_power = power; // find max power of frequency bin
+			}
+
+			bin_power = log(bin_power);
+			if (bin_power < 0) bin_power = 0;
+
+			freqvec_smooth[i] = freqvec_smooth[i] * smoothing + (bin_power * (1 - smoothing) * SCALE); // apply smoothing to avoid jittery display
+
+			freq_start = freq_end;
 		}
 
-		float max = *max_element(freqvec_abs.begin(), freqvec_abs.end()); 
-		float min = *min_element(freqvec_abs.begin(), freqvec_abs.end()); 
+		// draw bars
+		float space = (2.0-(BAR_SPACE*(FREQUENCY_BINS-1)))/FREQUENCY_BINS;
+		float pos = -FREQUENCY_BINS*space/(2.0-(BAR_SPACE*(FREQUENCY_BINS-1)));
 
-		for (int i = 0; i < freqvec_abs.size(); i++) {
-			float data = -1 + ((1-(-1))/(max-min))*(freqvec_abs[i]-min); // map to canonical range
-			V.col(i) << pos, data;
-			C.col(i) << colors.col(dis(gen));
-			pos += space;
+		float curr_max = *max_element(freqvec_smooth.begin(), freqvec_smooth.end());
+		if (curr_max > max) max = curr_max;
+		
+		for (int i = 0; i < FREQUENCY_BINS; i++) {
+			float data = -1 + ((1-(-1))/max) * freqvec_smooth[i]; // map to canonical range, scaled by max frequency of audio slice
+
+			// change color based on bar height
+			Eigen::Vector3f color;
+			if (data < -0.5) {
+				color = Eigen::Vector3f(0.6, 0.725, 0.596);
+			} else if (data < 0) {
+				color = Eigen::Vector3f(0.992, 0.807, 0.666);
+			} else if (data < 0.5) {
+				color = Eigen::Vector3f(0.956, 0.513, 0.49);
+			} else {
+				color = Eigen::Vector3f(0.921, 0.286, 0.376);
+			}
+
+			V.col(i*6) << pos, -1; // lower left
+			V.col(i*6+1) << pos, data; // upper left
+			V.col(i*6+2) << pos+space, data; // upper right
+			V.col(i*6+3) << pos+space, -1; // lower right
+
+			// repeated vertices
+			V.col(i*6+4) << V.col(i*6);
+			V.col(i*6+5) << V.col(i*6+2);
+			
+			for (int j = 0; j <= 5; j++) {
+				C.col(i*6+j) << color;
+			}
+
+			pos += space + BAR_SPACE;
 		}
 
         totalFramesRead += framesReadThisIteration;
@@ -200,17 +186,6 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 	filename = argv[1];
-
-	colors <<
-		0.345, 0.486, 0.486,
-		0, 0.247, 0.368,
-		0, 0.486, 0.518,
-		0.910, 0.839, 0.4,
-		0.620, 0.651, 0.082,
-		0.733, 0.878, 0.808,
-		0.996, 0.863, 0.757,
-		0.969, 0.631, 0.549,
-		0.945, 0.341, 0.247;
 
 	view <<
 		1,	0,	0,	0,
@@ -273,11 +248,9 @@ int main(int argc, char *argv[]) {
 	// Initialize the VBO with the vertices data
 	// A VBO is a data container that lives in the GPU memory
 	VBO.init();
-	V.resize(2, 1);
 	VBO.update(V);
 
 	VBO_C.init();
-	C.resize(3, 1);
 	VBO_C.update(C);
 
 	// Initialize the OpenGL Program
@@ -321,12 +294,6 @@ int main(int argc, char *argv[]) {
 	program.bindVertexAttribArray("position", VBO);
 	program.bindVertexAttribArray("color", VBO_C);
 
-	// Register the keyboard callback
-	glfwSetKeyCallback(window, key_callback);
-
-	// Register the mouse callback
-	glfwSetMouseButtonCallback(window, mouse_button_callback);
-
 	// play sound (https://github.com/dr-soft/miniaudio/blob/master/examples/simple_playback.c)
 	result = ma_decoder_init_file(("../sounds/" + filename).c_str(), NULL, &decoder);
 	if (result != MA_SUCCESS) {
@@ -339,6 +306,7 @@ int main(int argc, char *argv[]) {
     deviceConfig.playback.channels = decoder.outputChannels;
 	CHANNEL_COUNT = decoder.outputChannels;
     deviceConfig.sampleRate = decoder.outputSampleRate;
+	SAMPLE_RATE = decoder.outputSampleRate;
     deviceConfig.dataCallback = data_callback;
     deviceConfig.pUserData = &decoder;
 
@@ -371,13 +339,13 @@ int main(int argc, char *argv[]) {
 		glUniformMatrix4fv(program.uniform("view"), 1, GL_FALSE, view.data());
 
 		// Clear the framebuffer
-		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+		glClearColor(0.152f, 0.211f, 0.231f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT);
 
 		// visualize data
 		VBO.update(V);
 		VBO_C.update(C);
-		glDrawArrays(GL_LINE_STRIP, 0, total_vertices);
+		glDrawArrays(GL_TRIANGLES, 0, TOTAL_VERTICES);
 
 		// Swap front and back buffers
 		glfwSwapBuffers(window);
